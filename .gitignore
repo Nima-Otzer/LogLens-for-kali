@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LogLens generated exports
+loglens_export.csv
+
+# Keep the synthetic sample log in the repository
+!loglens_sample_new.log
