@@ -17,7 +17,7 @@ A local-first Linux log analyzer and GUI continuation of my CLI-based Week 3 Pre
 - PySide6
 - Matplotlib
 
-## Run locally
+## Run locally (incase downloadable build doesn't work)
 
 Create and activate a virtual environment, then install dependencies:
 
