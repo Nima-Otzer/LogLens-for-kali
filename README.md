@@ -1,4 +1,4 @@
-# LogLens for Kali
+# Log Analyzer linux
 
 A local-first Linux log analyzer and GUI continuation of my CLI-based Week 3 Prep project.
 
