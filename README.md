@@ -34,3 +34,4 @@ python "#LogLens-Kali log analyzer.py"
 ```
 
 LogLens is under development. Its correlation and investigation features are heuristic and do not establish causation.
+LogLens is under development. Its correlation and investigation features are heuristic and do not establish causation
