@@ -2,9 +2,9 @@ import sys
 import csv
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import Counter
-
+import re
 
 
 from PySide6.QtWidgets import (
@@ -23,6 +23,7 @@ HIGH_SEVERITY = {"EMERGENCY", "ALERT", "CRITICAL", "ERROR"}
 
 
 def analyze_log_file(path):
+    """Read a timestamp/severity/message log and collect validated events."""
     severity_counts = {level: 0 for level in SEVERITIES}
     events = []
     message_count = Counter()
@@ -30,14 +31,14 @@ def analyze_log_file(path):
     skipped_count = unknown_count = invalid_count = 0
 
     with open(path, encoding="utf-8", errors="replace") as file:
-        for line in file:
+        for line_number, line in enumerate(file, start=1):
             parts = line.split()
 
             if len(parts) < 2:
                 skipped_count += 1
                 continue
 
-            timestamp = parts[0] + " " + parts[1]
+            timestamp = f"{parts[0]} {parts[1]}"
 
             try:
                 datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
@@ -50,7 +51,6 @@ def analyze_log_file(path):
                 continue
 
             severity = parts[2].upper()
-
             if severity not in severity_counts:
                 unknown_count += 1
                 continue
@@ -59,14 +59,19 @@ def analyze_log_file(path):
                 skipped_count += 1
                 continue
 
-            message = " ".join(parts[3:])
+            message = " ".join(parts[3:]).strip()
+            if not message:
+                skipped_count += 1
+                continue
 
-            severity_counts[severity] += 1
-            events.append({
+            event = {
                 "timestamp": timestamp,
                 "severity": severity,
-                "message": message
-            })    
+                "message": message,
+                "line_number": line_number,
+            }
+            events.append(event)
+            severity_counts[severity] += 1
             message_count[message] += 1
 
             if severity in HIGH_SEVERITY:
@@ -84,177 +89,357 @@ def analyze_log_file(path):
         "invalid": invalid_count,
     }
 
+def identify_componenets(message):
+    message_lower =message.lower()
+
+    components = []
+
+    job_ids = re.findall(r'\bjob\s+(\d+)\b', message_lower)
+
+    for job_id in job_ids:
+        components.append(f"job:{job_id}")
+
+    file_paths = re.findall(
+        r'(/[a-zA-Z0-9_./-]+)',
+        message
+    ) 
+
+    for path in file_paths: 
+        components.append(f"file:{path}")
+
+    component_keywords = {
+        "worker": ["worker"],
+        "worker_queue": ["worker queue", "queue connection"],
+        "database": ["database", "db connection"],
+        "authentication": ["authentication", "login"],
+        "backup": ["backup"],
+        "network": ["network", "connection"],
+        "storage": ["disk", "storage"]
+    }
+
+    for component, keywords in component_keywords.items():
+        if any(keyword in message_lower for keyword in keywords):
+            components.append(components)
+
+    return list(set(components))        
+
 def build_investigation_findings(results, window_seconds=60):
-    """Generate evidence_based finfings from analyzed log events."""
+    """
+    Detect repeated high-severity messages and high-severity bursts.
 
-    events = results["events"]
+    Findings are heuristic indicators. They do not establish a common cause.
+    """
+    if window_seconds < 1:
+        raise ValueError("window_seconds must be at least 1")
+
+    events = sorted(
+        results.get("events", []),
+        key=lambda event: event["timestamp"]
+    )
     findings = []
-
-    failure_terms = (
-        "failed", "failure", "unavailable", "timed out",
-        "premission denied", "stopped unexpectedly",
-    )
-
-    recovery_terms = (
-        "recovered", "restored", "became available",
-        "completed successfully", "succeeded",
-    )
 
     def parse_time(event):
         return datetime.strptime(
             event["timestamp"], "%Y-%m-%d %H:%M:%S"
         )
 
-    for message, count in results["high_severity_messages"].items():
-        if count < 2:
-            continue
-
-        matching_events = [
-            event for event in events
-            if event["message"] == message
-            and event["severity"] in HIGH_SEVERITY
-        ]    
-
-        findings.append({
-            "priority": "HIGH",
-            "category": "Repeated failure",
-            "title": f"Repeated high-severity message: {message}",
-            "evidence": [
-                f"{event['timestamp']} | {event['severity']} | "
-                f"{event['message']}"
-                for event in matching_events
-            ],
-            "explanation": (
-                f"This exact high-severity message appered {count} "
-                "times in the analyzed log."
-            ),
-
-        })
-
-        high_events = [
-            event for event in events
-            if event["severity"] in HIGH_SEVERITY
+    def format_evidence(matching_events):
+        return [
+            f"{event['timestamp']} | {event['severity']} | "
+            f"{event['message']}"
+            for event in matching_events
         ]
 
-        cluster = []
+    def add_finding(priority, category, title, explanation,
+                    signals, matching_events):
+        # Deduplicate evidence while preserving chronological order.
+        unique = {
+            (
+                event["timestamp"],
+                event["severity"],
+                event["message"],
+            ): event
+            for event in matching_events
+        }
+        ordered = sorted(unique.values(), key=parse_time)
 
-        for event in high_events:
-            if not cluster:
-                cluster = [event]
+        if not ordered:
+            return
+
+        findings.append({
+            "priority": priority,
+            "category": category,
+            "title": title,
+            "explanation": explanation,
+            "signals": signals,
+            "evidence": format_evidence(ordered),
+            "start_time": ordered[0]["timestamp"],
+            "end_time": ordered[-1]["timestamp"],
+            "_evidence_keys": set(unique),
+        })
+
+    repeated_groups = {}
+    for event in events:
+        if event["severity"] in HIGH_SEVERITY:
+            key = event["message"].casefold()
+            repeated_groups.setdefault(key, []).append(event)
+
+    for matching in repeated_groups.values():
+        if len(matching) < 2:
+            continue
+
+        message = matching[0]["message"]
+        add_finding(
+            priority="HIGH" if len(matching) >= 3 else "MEDIUM",
+            category="Repeated failure",
+            title=f"Repeated high-severity message: {message}",
+            explanation=(
+                "The same message was recorded multiple times at a "
+                "high severity. This indicates recurring activity, "
+                "but does not identify its underlying cause."
+            ),
+            signals=[
+                f"Observed {len(matching)} occurrences across the log."
+            ],
+            matching_events=matching,
+        )
+
+    high_events = [
+        event for event in events
+        if event["severity"] in HIGH_SEVERITY
+    ]
+    parsed_high_events = [
+        (parse_time(event), event) for event in high_events
+    ]
+
+    burst_candidates = []
+    left = 0
+
+    for right, (right_time, _) in enumerate(parsed_high_events):
+        while (
+            right_time - parsed_high_events[left][0]
+        ).total_seconds() > window_seconds:
+            left += 1
+
+        window_events = [
+            event
+            for _, event in parsed_high_events[left:right + 1]
+        ]
+
+        if len(window_events) >= 3:
+            burst_candidates.append(window_events)
+
+    merged_bursts = []
+    for candidate in burst_candidates:
+        candidate_keys = {
+            (event["timestamp"], event["severity"], event["message"])
+            for event in candidate
+        }
+
+        if not merged_bursts:
+            merged_bursts.append(candidate)
+            continue
+
+        previous_keys = {
+            (event["timestamp"], event["severity"], event["message"])
+            for event in merged_bursts[-1]
+        }
+
+        if candidate_keys & previous_keys:
+            combined = {
+                (
+                    event["timestamp"],
+                    event["severity"],
+                    event["message"],
+                ): event
+                for event in merged_bursts[-1] + candidate
+            }
+            merged_bursts[-1] = sorted(
+                combined.values(), key=parse_time
+            )
+        else:
+            merged_bursts.append(candidate)
+
+    for burst in merged_bursts:
+        breakdown = Counter(
+            event["severity"] for event in burst
+        )
+        details = ", ".join(
+            f"{severity}: {count}"
+            for severity, count in breakdown.items()
+        )
+
+        add_finding(
+            priority="HIGH" if any(
+                event["severity"] in {"EMERGENCY", "ALERT", "CRITICAL"}
+                for event in burst
+            ) else "MEDIUM",
+            category="High-severity burst",
+            title=f"{len(burst)} high-severity events within "
+                  f"{window_seconds} seconds",
+            explanation=(
+                "Several high-severity events occurred close together. "
+                "This concentration deserves review, but timing alone "
+                "does not prove that the events share a cause."
+            ),
+            signals=[
+                f"High-severity event count: {len(burst)}",
+                f"Severity breakdown: {details}",
+            ],
+            matching_events=burst,
+        )
+
+    failure_terms = (
+        "failed", "failure", "unavailable", "timed out",
+        "permission denied", "stopped unexpectedly", "cannot reach",
+    )
+    recovery_terms = (
+        "recovered", "restored", "became available",
+        "completed successfully", "succeeded", "connection established",
+    )
+    ignored_words = {
+        "the", "and", "for", "from", "with", "while", "after",
+        "before", "service", "application", "system", "failed",
+        "failure", "error", "warning", "critical", "successfully",
+        "completed", "restored", "available", "unavailable",
+    }
+
+    def meaningful_words(message):
+        words = {
+            word.strip(".,:;()[]{}'\"").casefold()
+            for word in message.split()
+        }
+        return {
+            word for word in words
+            if len(word) > 2 and word not in ignored_words
+        }
+
+    recovery_findings_seen = set()
+
+    for index, failure in enumerate(events):
+        failure_message = failure["message"].casefold()
+        if not any(term in failure_message for term in failure_terms):
+            continue
+
+        failure_time = parse_time(failure)
+        failure_words = meaningful_words(failure["message"])
+
+        for later in events[index + 1:]:
+            elapsed = (parse_time(later) - failure_time).total_seconds()
+            if elapsed > window_seconds:
+                break
+            if elapsed <= 0:
                 continue
 
-            elapsed = (
-                parse_time(event) - parse_time(cluster[0])
-            ).total_seconds()
+            later_message = later["message"].casefold()
+            if not any(term in later_message for term in recovery_terms):
+                continue
 
-            if elapsed <= window_seconds:
-                cluster.append(event)
-            else:
-                if len(cluster) >= 3:
-                    findings.append({
-                        "priority": "HIGH",
-                        "category": "Severity burst",
-                        "title": (
-                            f"{len(cluster)} high-severity events "
-                            "within the time window"
-                        ),
-                        "evidence": [
-                            f"{item['timestamp']} | {item['severity']} | "
-                            f"{item['message']}"
-                            for item in cluster
-                        ],
-                        "explaination": (
-                            "Several high-severity events occured within "
-                            f"{window_seconds} seconds. Their timing alone "
-                            "does not establish a shared causea."
-                        )
-                    }) 
+            later_words = meaningful_words(later["message"])
+            shared_words = failure_words & later_words
 
-                cluster = [event] 
+            if not shared_words:
+                continue
 
-        if len(cluster) >= 3:
-            findings.append({
-                "priority": "HIGH",
-                "category": "Severity burst",
-                "title": (
-                    f"{len(cluster)} high-severity events "
-                    "within the time window"
+            pair_key = (
+                failure["timestamp"], failure["message"],
+                later["timestamp"], later["message"],
+            )
+            if pair_key in recovery_findings_seen:
+                continue
+            recovery_findings_seen.add(pair_key)
+
+            add_finding(
+                priority="LOW",
+                category="Possible recovery",
+                title=f"Possible recovery after: {failure['message']}",
+                explanation=(
+                    "A later message contains recovery-related wording "
+                    "and shares terms with the earlier failure. This is "
+                    "a possible recovery indicator, not confirmation "
+                    "that the underlying issue was resolved."
                 ),
-                "evidence": [
-                    f"{item['timestamp']} | {item['severity']} | "
-                    f"{item['message']}"
-                    for item in cluster
+                signals=[
+                    f"Recovery-like message observed {int(elapsed)} "
+                    f"seconds later.",
+                    "Shared message terms: "
+                    + ", ".join(sorted(shared_words)),
                 ],
-                "explaination": (
-                    "Several high-severity events occured within "
-                    f"{window_seconds} seconds. Their timing alone "
-                    "does not establish a shared cause"
-                ),
-            })
+                matching_events=[failure, later],
+            )
 
-            for index, event in enumerate(events):   
-                message = event["message"].lower()
+    consolidated = []
+    for finding in findings:
+        overlapping = [
+            existing for existing in consolidated
+            if existing["_evidence_keys"] & finding["_evidence_keys"]
+        ]
 
-                if not any(term in message for term in failure_terms):
-                    continue
+        if not overlapping:
+            consolidated.append(finding)
+            continue
 
-                failure_time = parse_time(event)
+        target = overlapping[0]
+        target["_evidence_keys"].update(finding["_evidence_keys"])
+        target["signals"] = list(dict.fromkeys(
+            target["signals"] + finding["signals"]
+        ))
 
-                for later_event in events[index + 1:]:
-                    elapsed = (
-                        parse_time(later_event) - failure_time
-                    ).total_seconds()
+        evidence_by_key = {}
+        for evidence_line in target["evidence"] + finding["evidence"]:
+            parts = evidence_line.split(" | ", 2)
+            if len(parts) == 3:
+                evidence_by_key[(parts[0], parts[1], parts[2])] = evidence_line
 
-                    if elapsed > 120:
-                        break 
+        ordered_keys = sorted(
+            evidence_by_key,
+            key=lambda key: key[0]
+        )
+        target["evidence"] = [
+            evidence_by_key[key] for key in ordered_keys
+        ]
+        target["start_time"] = ordered_keys[0][0]
+        target["end_time"] = ordered_keys[-1][0]
 
-                    later_message = later_event["message"].lower()
+        if finding["priority"] == "HIGH":
+            target["priority"] = "HIGH"
+        if finding["category"] not in target["category"]:
+            target["category"] += " + " + finding["category"]
 
-                    if any(term in later_message for term in recovery_terms):
-                        findings.append({
-                            "priority": "MEDIUM",
-                            "category": "Possible recovery",
-                            "title": (
-                                f"Possible recovery after: {event['message']}"
-                            ),
-                            "evidence": [
-                                f"{event['timestamp']} | {event['severity']} | "
-                                f"{event['message']}",
-                                f"{later_event['timestamp']} | "
-                                f"{later_event['severity']} | "
-                                f"{later_event['message']}",
-                            ],
-                            "explanation": (
-                                f"A possible recovery message appeared "
-                                f"{int(elapsed)} seconds after the failure. "
-                                "This timing does not prove the failure was resolved."
-                            ),
-                        })
-                        break 
-                    
-                findings.sort(
-                    key=lambda finding: (
-                        {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(
-                            finding["priority"], 3
-                        ),
-                        finding["title"]
-                    )
-                )    
+        if finding["title"] not in target["title"]:
+            target["title"] += " / " + finding["title"]
 
-                return findings
+        for extra in overlapping[1:]:
+            target["_evidence_keys"].update(extra["_evidence_keys"])
+            target["signals"] = list(dict.fromkeys(
+                target["signals"] + extra["signals"]
+            ))
+            consolidated.remove(extra)
+
+    for finding in consolidated:
+        finding.pop("_evidence_keys", None)
+
+    priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    consolidated.sort(
+        key=lambda finding: (
+            priority_order.get(finding["priority"], 3),
+            finding["start_time"],
+        )
+    )
+    return consolidated
 
 
 class LogLensWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LogLens — Linux Log Analyzer")
+        self.setWindowTitle("Linux Log Analyzer")
         self.resize(1100, 700)
         self.results = None
 
         root = QWidget()
         layout = QVBoxLayout(root)
 
-        heading = QLabel("LogLens")
+        heading = QLabel("Linux Log Analyzer")
         heading.setStyleSheet("font-size: 28px; font-weight: bold;")
 
         toolbar = QHBoxLayout()
@@ -268,7 +453,7 @@ class LogLensWindow(QMainWindow):
         self.filter.currentTextChanged.connect(self.populate_events)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("search log messages...")
+        self.search_box.setPlaceholderText("Search log messages...")
         self.search_box.textChanged.connect(self.populate_events)
 
         self.export_button = QPushButton("Export CSV")
@@ -307,7 +492,7 @@ class LogLensWindow(QMainWindow):
         self.tabs.addTab(summary_widget, "Analysis Summary")
         self.investigation = QTextEdit()
         self.investigation.setReadOnly(True)
-        self.tabs.addTab(self.investigation, "investigation")
+        self.tabs.addTab(self.investigation, "Investigation")
         
         layout.addWidget(heading)
         layout.addLayout(toolbar)
@@ -347,7 +532,7 @@ class LogLensWindow(QMainWindow):
             return
 
         QMessageBox.information(
-            self, "Export complete", "Filetered events exported successfully."
+            self, "Export complete", "Filtered events exported successfully."
         )
 
     def open_file(self):
@@ -432,114 +617,89 @@ class LogLensWindow(QMainWindow):
 
         self.event_table.resizeColumnsToContents()
 
-    def find_correlated_events(self, window_second=60):
+    def find_correlated_events(self, window_seconds=60):
+        """Group nearby events for timeline context; not causal proof."""
         if self.results is None:
-            return[]
+            return []
 
         events = self.results["events"]
         groups = []
         current_group = []
+        current_start = None
+        previous_time = None
 
         for event in events:
             timestamp = datetime.strptime(
                 event["timestamp"], "%Y-%m-%d %H:%M:%S"
-            )    
-
-            timed_event = {**event, "_parsed_time": timestamp}
+            )
 
             if not current_group:
-                current_group = [timed_event]
+                current_group = [event]
+                current_start = timestamp
+                previous_time = timestamp
                 continue
 
-            group_start_time = current_group[0]["_parsed_time"]
-            gap = (timestamp - group_start_time).total_seconds()
+            total_gap = (timestamp - current_start).total_seconds()
+            consecutive_gap = (timestamp - previous_time).total_seconds()
 
-            previous_time = current_group[-1]["_parsed_time"]
-            gap_from_previous = (timestamp - previous_time).total_seconds()
-
-            if gap <= window_second and gap_from_previous <= 30:
-                current_group.append(timed_event)
+            if total_gap <= window_seconds and consecutive_gap <= 30:
+                current_group.append(event)
             else:
                 if len(current_group) > 1:
                     groups.append(current_group)
+                current_group = [event]
+                current_start = timestamp
 
-                current_group = [timed_event]
+            previous_time = timestamp
 
         if len(current_group) > 1:
             groups.append(current_group)
 
         reports = []
-
         for group in groups:
-            messages = Counter(
-               event["message"] for event in group
+            message_counts = Counter(
+                event["message"] for event in group
             )
-
-            high_severity_repeats = {
-                message: count
-                for message, count in self.results["high_severity_messages"].items()
+            repeated_messages = [
+                (message, count)
+                for message, count in message_counts.items()
                 if count > 1
-            }
-
-            high_severity_count = sum(
-               event["severity"] in HIGH_SEVERITY
-               for event in group
-            )
-
-            reasons = []
-
-            repeated_messages = {
-                message: count
-                for message, count in messages.items()
-                if count > 1
-            }
-
-            for message, count in repeated_messages.items():
-                reasons.append(
-                    f'Repeated message: "{message}"'
-                    f'({count} occurrences)'
-                )
-
-            high_severity_events = [
+            ]
+            high_events = [
                 event for event in group
                 if event["severity"] in HIGH_SEVERITY
-            ]    
+            ]
 
-            if len(high_severity_events) >= 2:
-                severity_counts = Counter(
-                    event["severity"]
-                    for event in high_severity_events
-                )
-                breakdown = ", ".join(
-                    f"{severity}: {count}"
-                    for severity, count in severity_counts.items()
-                )
-
+            reasons = []
+            for message, count in repeated_messages:
                 reasons.append(
-                    f"High-severity cluster: "
-                    f"{len(high_severity_events)} events ({breakdown})"
+                    f'Repeated message: "{message}" ({count} occurrences)'
+                )
+
+            if len(high_events) >= 2:
+                breakdown = Counter(
+                    event["severity"] for event in high_events
+                )
+                details = ", ".join(
+                    f"{severity}: {count}"
+                    for severity, count in breakdown.items()
+                )
+                reasons.append(
+                    f"High-severity cluster: {len(high_events)} events "
+                    f"({details})"
                 )
 
             if not reasons:
                 reasons.append(
-                    "Temporal proximity only "
-                    f"(within {window_second} seconds)"
+                    f"Temporal proximity only (within {window_seconds} seconds)"
                 )
 
-            clean_events = [
-                {
-                    key: value
-                    for key, value in event.items()
-                    if key != "_parsed_time"
-                }
-                for event in group
-            ]
-
             reports.append({
-                "events": clean_events,
+                "events": group,
                 "reasons": reasons,
-            })            
-        return reports    
+            })
+
+        return reports
 
     def populate_summary(self):
         result = self.results
@@ -618,11 +778,19 @@ class LogLensWindow(QMainWindow):
                 f"{number}. [{finding['priority']}] "
                 f"{finding['category']}"
             )
-            report.append(finding['title'])
+            report.append(finding["title"])
+            report.append(
+                f"Period: {finding['start_time']} to {finding['end_time']}"
+            )
             report.append(
                 finding.get("explanation", "No explanation provided.")
             )
-            report.append("Evidence:")
+
+            report.append("Detected signals:")
+            for signal in finding.get("signals", []):
+                report.append(f"  - {signal}")
+
+            report.append("Evidence:")    
 
             for evidence in finding.get("evidence", []):
                 report.append(f"  - {evidence}")
@@ -666,19 +834,6 @@ class LogLensWindow(QMainWindow):
 
         self.summary.append("\n"+"\n".join(lines))    
 
-test_results = analyze_log_file("/home/manjusri/Documents/Terra/Loglens/loglens_sample_new.log")
-test_findings = build_investigation_findings(test_results)
-
-print("\nINVESTIGATION ENGINE TEST")
-print(f"Total findings: {len(test_findings)}")
-
-for finding in test_findings:
-    print(f"\n[{finding['priority']}]{finding['category']}")
-    print(finding["title"])
-    print(finding.get("explanation", "No explanation provided."))
-
-    for evidence in finding.get("evidence", []):
-        print(f" - {evidence}")
 
 app = QApplication(sys.argv)
 window = LogLensWindow()
